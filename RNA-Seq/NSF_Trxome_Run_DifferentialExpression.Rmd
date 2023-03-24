@@ -1,0 +1,305 @@
+---
+title: "NSF_Trxome_Run_DifferentialExpression"
+author: "Noah Winters"
+date: "1/27/2021"
+output: html_document
+---
+```{r include=FALSE, echo=FALSE, warning=FALSE}
+library(tidyverse)
+library(PCAtools)
+library(DESeq2)
+library(edgeR)
+library(lasso2)
+library(DEGreport)
+library(maSigPro)
+library(RColorBrewer)
+library(gplots)
+library(ggfortify)
+library(pheatmap)
+library(dendextend)
+library(corrplot)
+library(cowplot)
+library(VennDiagram)
+library(knitr)
+library(hexbin)
+library(data.table)
+
+```
+
+```{r load_data}
+# Expression table
+expr <- read.table("Theobroma_cacao_SCA-6_chr.v1.0.fractional.counts.tsv", header = TRUE) %>%
+  .[,-2] %>%
+  column_to_rownames(., var = "GeneID")
+expr <- expr %>%
+  .[,-grep("ICS1", colnames(.))] %>%
+  .[,-grep("SCA6", colnames(.))] %>%
+  floor(.)
+
+# Number of samples for which count > 10
+bigCells=apply(expr,1,function(x) sum(x>=10))
+
+# Filter out gene if number of samples with > 10 counts is < 20
+expr <- expr[bigCells>=20,]
+
+# Problematic genes
+# List of highly expressed genes (>= 1% of total library)
+# c("SCA-6_Chr1v1_01003.1", "SCA-6_Chr4v1_12652.1", "SCA-6_Chr7v1_19594.1", "SCA-6_Chr4v1_10820.1",
+#          "SCA-6_Chr1v1_01328.1", "SCA-6_Chr9v1_24165.1", "SCA-6_Chr6v1_18233.1", "SCA-6_Chr8v1_21284.1",
+#          "SCA-6_Chr4v1_11963.1", "SCA-6_Chr7v1_19103.1", "SCA-6_Chr7v1_19904.1", "SCA-6_Chr8v1_21958.1",
+#          "SCA-6_Chr5v1_14023.1", "SCA-6_Chr9v1_23991.1", "SCA-6_Chr5v1_15974.1", "SCA-6_Chr1v1_03949.1",
+#          "SCA-6_Chr1v1_01664.1")
+
+rem <- c("SCA-6_Chr7v1_19904.1", "SCA-6_Chr5v1_14023.1")
+
+# Remove them from list
+expr <- expr[!(rownames(expr) %in% rem),]
+
+# Gene annotations
+annot <- fread("SCA6_annot.txt", header = TRUE) %>%
+  setNames(., nm = c("Gene", "Desc"))
+
+
+```
+
+```{r filter_data1, include = FALSE}
+# Read in metadata
+metaData <- read.csv("NSF_Trxome_metaData_Complete.csv", header = TRUE) %>%
+  column_to_rownames(., var = "Library_ID") %>%
+  .[,-c(grep("lux", colnames(.)))]
+
+# Alphabetically order rownames
+metaData <- metaData[ order(rownames(metaData)), ]
+
+```
+
+```{r filter_dataII, include = FALSE}
+# Set up metadata--genotype factors containing info on pheno, geno, and treat
+# Adjust colData
+colData <- path_host %>%
+  column_to_rownames(., var = "Library_ID")
+
+colData <- colData[,-grep("Time", colnames(colData))]
+
+# Remove ICS1 and SCA6
+colData <- colData[-grep("ICS1", rownames(colData)),] %>%
+    .[-grep("SCA6", rownames(.)),]
+
+# Add tray position 
+colData$Tray <- ifelse(grepl("[1-2]A",rownames(colData)) == TRUE, "A",
+                       ifelse(grepl("[1-2]B",rownames(colData)) == TRUE, "B", "C"))
+
+# Set up factor that contains info for both genetic group AND phenotype
+conds=paste(gsub("_.*", "", rownames(colData)),
+            tolower(substr(colData$Treatment,1,5)),
+            tolower(colData$Phenotype),
+            tolower(colData$Gen_Group), sep = "_")
+colData$cond=conds
+
+# Subset expression matrix by library names--make sure to find out where PINA libraries are located
+expr <- expr[,rownames(colData)]
+```
+
+```{r run_model, eval = FALSE}
+# Create DESeq expression object
+dds <- DESeqDataSetFromMatrix(countData = expr,
+                              colData = colData,
+                              design =  ~ 0 + 
+                                cond + 
+                                Leaf1_Stage + 
+                                Tray)
+
+# Run model
+dds <- DESeq(dds, parallel = T, quiet = TRUE, betaPrior = FALSE)
+
+# Output normalized counts
+norm_expr <- assay(vst(dds))
+
+# Adjust for covariates-- suggested by Michael Love here: https://support.bioconductor.org/p/79283/
+norm_expr <- removeBatchEffect(norm_expr, batch = dds$Leaf1_Stage, batch2 = dds$Tray)
+
+```
+
+```{r genetic_grp_contrasts}
+##############################################
+### Contrast Weights -- Each Genetic Group ###
+##############################################
+genetic_group <- c("iquitos", "guiana", "maranon", "nanay")
+resNames <- resultsNames(dds)
+
+PTInteractAll=PmainAll=TmainAll=rep(0,length(resNames))
+
+for (grp in genetic_group){
+  
+  # Set up weights for contrasts
+  TR <- grepl(paste0("_treat_r_", grp), resNames)
+  TS <- grepl(paste0("_treat_s_", grp), resNames)
+  CR <- grepl(paste0("_contr_r_",grp), resNames)
+  CS <- grepl(paste0("_contr_s_", grp), resNames)
+  
+  # Interaction term
+  InteractCont=((TR/sum(TR)-TS/sum(TS))-(CR/sum(CR)-CS/sum(CS)))/2
+  
+  # Phenotype and treatment main effect contrasts
+  PmainCont=((TR/sum(TR)+CR/sum(CR))-(TS/sum(TS)+CS/sum(CS)))/2
+  TmainCont=((TR/sum(TR)+TS/sum(TS))-(CR/sum(CR)+CS/sum(CS)))/2
+  
+  
+  ########################
+  ### Treatment effect ###
+  ########################
+  # Treatment main effect
+  resNames <- resultsNames(dds)
+  TMainLFC=results(dds, contrast=TmainCont, pAdjustMethod = "fdr")
+  # TMainLFC <- lfcShrink(dds,
+  #                          type = "ashr", 
+  #                          res = Tmain,
+  #                          quiet = TRUE)
+  
+  dfname <- paste0("TmainLFC_",grp)
+  assign(dfname, data.frame(TMainLFC))
+  
+  summary(TMainLFC, alpha = 0.05)
+  hist(TMainLFC$pvalue, nclass = 100, main = paste0("Treatment Effect, ", toupper(grp)))
+  
+  ########################
+  ### Phenotype effect ###
+  ########################
+  # Phenotype main effect
+  PMainLFC=results(dds,contrast=PmainCont,pAdjustMethod = "fdr")
+  # PMainLFC <- lfcShrink(dds,
+  #                          type = "ashr", 
+  #                          res = Pmain,
+  #                          quiet = TRUE)
+  
+  dfname <- paste0("PmainLFC_",grp)
+  assign(dfname, data.frame(PMainLFC))
+  
+  summary(PMainLFC, alpha = 0.05)
+  hist(PMainLFC$pvalue, nclass = 100, main = paste0("Phenotype Effect, ", toupper(grp)))
+  
+  
+  ####################################
+  ### Treatment * Phenotype effect ###
+  ####################################
+  
+  # Treatment* Phenotype interaction 
+  PTinteractLFC=results(dds, contrast=InteractCont, pAdjustMethod = "fdr")
+  # PTinteractLFC <- lfcShrink(dds,
+  #                          type = "ashr", 
+  #                          res = PTinteract,
+  #                          quiet = TRUE)
+  
+  dfname <- paste0("PTinteractLFC_",grp)
+  assign(dfname, data.frame(PTinteractLFC))
+  
+  summary(PTinteractLFC, alpha = 0.05)
+  hist(PTinteractLFC$pvalue, nclass = 100, main = paste0("Treatment*Phenotype Interaction, ", toupper(grp)))
+  
+}
+
+
+```
+
+# Contrast weights for most models
+```{r}
+##############################################
+### Contrast Weights -- All Genetic Groups ###
+##############################################
+genetic_group <- c("iquitos", "guiana", "maranon", "nanay")
+resNames <- resultsNames(dds)
+
+PTInteractAll=PmainAll=TmainAll=rep(0,length(resNames))
+
+for (grp in genetic_group){
+  
+  # Set up weights for contrasts
+  TR <- grepl(paste0("_treat_r_", grp), resNames)
+  TS <- grepl(paste0("_treat_s_", grp), resNames)
+  CR <- grepl(paste0("_contr_r_",grp), resNames)
+  CS <- grepl(paste0("_contr_s_", grp), resNames)
+  
+  
+    # Interaction term
+  InteractCont=((TR/sum(TR)-TS/sum(TS))-(CR/sum(CR)-CS/sum(CS)))/2
+  
+  # Phenotype and treatment main effect contrasts
+  PmainCont=((TR/sum(TR)+CR/sum(CR))-(TS/sum(TS)+CS/sum(CS)))/2
+  TmainCont=((TR/sum(TR)+TS/sum(TS))-(CR/sum(CR)+CS/sum(CS)))/2
+  
+  
+  # Save the contrasts
+  Pname = paste0("PmainCont_",grp)
+  assign(Pname, PmainCont)
+  
+  Tname <- paste0("TmainCont_",grp)
+  assign(Tname, TmainCont)
+  
+  PTname <- paste0("PTinteractCont_",grp)
+  assign(PTname, InteractCont)
+  }
+  
+```
+
+# Whole model--avereaged over genotypes--weighted contrasts
+```{r full_model_contrasts}
+########################
+### Treatment effect ###
+########################
+TmainAll <- (TmainCont_nanay + TmainCont_iquitos + TmainCont_maranon + TmainCont_guiana)/4
+TMainLFC=results(dds, contrast=TmainAll, pAdjustMethod = "fdr")
+# TMainLFC <- lfcShrink(dds,
+#                          type = "ashr", 
+#                          res = Tmain,
+#                          quiet = TRUE)
+
+summary(TMainLFC, alpha = 0.05)
+hist(TMainLFC$pvalue, nclass = 100, main = "Treatment Main Effect")
+
+TMainLFC <- data.frame(TMainLFC) %>%
+  rownames_to_column(., var = "Gene")
+
+########################
+### Phenotype effect ###
+########################
+
+PmainAll <- (PmainCont_nanay + PmainCont_iquitos + PmainCont_maranon + PmainCont_guiana)/4
+PMainLFC=results(dds,contrast=PmainAll,pAdjustMethod = "fdr")
+# PMainLFC <- lfcShrink(dds,
+#                          type = "ashr", 
+#                          res = Pmain,
+#                          quiet = TRUE)
+
+summary(PMainLFC, alpha = 0.05)
+hist(PMainLFC$pvalue, nclass = 100, main = "Phenotype Main Effect")
+
+PMainLFC <- data.frame(PMainLFC) %>%
+  rownames_to_column(., var = "Gene")
+
+
+####################################
+### Treatment * Phenotype effect ###
+####################################
+
+# Treatment* Phenotype interaction
+PTinteractAll <- (PTinteractCont_nanay + PTinteractCont_iquitos + PTinteractCont_maranon + PTinteractCont_guiana)/4
+PTinteractLFC=results(dds, contrast=PTinteractAll, pAdjustMethod = "fdr")
+# PTinteractLFC <- lfcShrink(dds,
+#                          type = "ashr",
+#                          res = PTinteract,
+#                          quiet = TRUE)
+
+summary(PTinteractLFC, alpha = 0.05)
+hist(PTinteractLFC$pvalue, nclass = 100, main = "Treatment * Phenotype Interaction")
+
+PTinteractLFC <- data.frame(PTinteractLFC) %>%
+  rownames_to_column(., var = "Gene")
+
+```
+
+A quick note about LFC calculations from Michael Love: 
+
+"The LFC is not the ratio of the mean of normalized counts when additional variables are in the design. It's a bit more complex to explain, but this is how you get language in research papers that say "controlling for the variables...". I'd recommend discussing this meaning more in depth with a statistical collaborator if you are interested."
+
+https://support.bioconductor.org/p/102318/
+
